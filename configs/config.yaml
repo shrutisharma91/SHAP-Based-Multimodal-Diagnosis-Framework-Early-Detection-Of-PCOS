@@ -1,0 +1,44 @@
+seed: 42
+
+paths:
+  clinical_data: data/raw/clinical/PCOS_data_without_infertility.xlsx   # .csv also supported
+  ultrasound_dir: data/raw/ultrasound          # subfolders: infected/  notinfected/
+  paired_csv: data/processed/paired_index.csv  # patient_id,image_path,label (needed for fusion)
+  artifacts: artifacts
+
+clinical:
+  sheet_name: Full_new        # only used for .xlsx
+  target: "PCOS (Y/N)"
+  id_col: "Patient File No."
+  drop_cols: ["Sl. No", "Unnamed: 44"]
+  test_size: 0.2
+  cv_folds: 5
+  xgb:
+    n_estimators: 400
+    max_depth: 4
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 2
+
+image:
+  backbone: efficientnet_b0   # efficientnet_b0 | resnet50
+  positive_class: infected    # folder name that means PCOS
+  img_size: 224
+  batch_size: 32
+  epochs: 15
+  lr: 0.0003
+  weight_decay: 0.0001
+  val_split: 0.2
+  num_workers: 2              # set 0 if you hit DataLoader issues on Windows
+
+fusion:
+  strategy: stacking          # stacking | weighted
+  weights: [0.6, 0.4]         # [clinical, image], used only for "weighted"
+  test_size: 0.3
+
+shap:
+  image_background: 64
+  image_samples: 6
+  image_nsamples: 200
+  top_k: 15
