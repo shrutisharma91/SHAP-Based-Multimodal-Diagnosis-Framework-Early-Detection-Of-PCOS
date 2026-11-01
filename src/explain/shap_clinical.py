@@ -1,4 +1,5 @@
-"""SHAP explanations for the clinical XGBoost model (TreeExplainer: exact, fast)."""
+"""SHAP explanations for a fitted clinical model, including modality summaries."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,71 +12,119 @@ import numpy as np
 import pandas as pd
 import shap
 
-from src.utils import ensure_dir
+_MODALITIES = ("symptoms", "hormones", "ultrasound", "vitals", "demographics")
 
 
 class ClinicalExplainer:
-    def __init__(self, model, background: pd.DataFrame | None = None) -> None:
-        # Interventional SHAP w.r.t. a background set if given, else tree-path dependent
-        self.explainer = shap.TreeExplainer(model, data=background, model_output="raw"
-                                            if background is None else "probability")
+    """Explain a fitted clinical classifier. Background rows should come from training data."""
 
-    def explain(self, X: pd.DataFrame) -> shap.Explanation:
-        return self.explainer(X)
+    def __init__(self, model, background) -> None:
+        frame = background if isinstance(background, pd.DataFrame) else pd.DataFrame(background)
+        self.feature_names = [str(column) for column in frame.columns]
+        self.explainer = shap.Explainer(_final_estimator(model), frame.to_numpy(dtype=float))
 
-    # ---------- global ----------
-    @staticmethod
-    def global_importance(sv: shap.Explanation, top_k: int = 15) -> pd.DataFrame:
-        imp = np.abs(sv.values).mean(axis=0)
-        df = pd.DataFrame({"feature": sv.feature_names, "mean_abs_shap": imp})
-        return df.sort_values("mean_abs_shap", ascending=False).head(top_k).reset_index(drop=True)
+    def explain(self, features) -> shap.Explanation:
+        frame = _aligned_frame(features, self.feature_names)
+        explanation = self.explainer(frame.to_numpy(dtype=float))
+        explanation.feature_names = self.feature_names
+        explanation.data = frame.to_numpy(dtype=float)
+        return _positive_explanation(explanation)
 
-    @staticmethod
-    def save_global_plots(sv: shap.Explanation, out_dir: str | Path, top_k: int = 15) -> None:
-        out = ensure_dir(out_dir)
-
-        shap.plots.beeswarm(sv, max_display=top_k, show=False)
-        plt.title("Clinical features – SHAP summary")
-        plt.tight_layout()
-        plt.savefig(out / "clinical_shap_beeswarm.png", dpi=200, bbox_inches="tight")
-        plt.close()
-
-        shap.plots.bar(sv, max_display=top_k, show=False)
-        plt.title("Clinical features – mean |SHAP|")
-        plt.tight_layout()
-        plt.savefig(out / "clinical_shap_bar.png", dpi=200, bbox_inches="tight")
-        plt.close()
-
-        # dependence plots for the top-3 drivers
-        top = ClinicalExplainer.global_importance(sv, 3)["feature"]
-        for feat in top:
-            shap.plots.scatter(sv[:, feat], color=sv, show=False)
-            plt.tight_layout()
-            safe = "".join(ch if ch.isalnum() else "_" for ch in feat)
-            plt.savefig(out / f"clinical_dependence_{safe}.png", dpi=200, bbox_inches="tight")
-            plt.close()
-
-    # ---------- local (per patient) ----------
-    @staticmethod
-    def save_patient_waterfall(sv: shap.Explanation, idx: int, out_path: str | Path, top_k: int = 12) -> None:
-        ensure_dir(Path(out_path).parent)
-        shap.plots.waterfall(sv[idx], max_display=top_k, show=False)
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=200, bbox_inches="tight")
-        plt.close()
-
-    @staticmethod
-    def patient_reasons(sv: shap.Explanation, idx: int, top_k: int = 5) -> dict[str, list[dict]]:
-        """Human-readable drivers for one patient, split by direction."""
-        row = pd.DataFrame({
-            "feature": sv.feature_names,
-            "value": sv.data[idx],
-            "shap": sv.values[idx],
-        })
-        up = row[row.shap > 0].nlargest(top_k, "shap")
-        down = row[row.shap < 0].nsmallest(top_k, "shap")
-        to_list = lambda d: [  # noqa: E731
-            {"feature": r.feature, "value": round(float(r.value), 3), "shap": round(float(r.shap), 4)}
-            for r in d.itertuples()
+    def save_global_plots(self, explanation, out_dir, top_k: int = 15) -> list[Path]:
+        """Write beeswarm, bar, and dependence plots for the three strongest features."""
+        destination = Path(out_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        values, data, names = _arrays(explanation)
+        written = [
+            _summary(values, data, names, destination / "beeswarm.png", top_k, "dot"),
+            _summary(values, data, names, destination / "bar.png", top_k, "bar"),
         ]
-        return {"increases_risk": to_list(up), "decreases_risk": to_list(down)}
+        order = np.argsort(np.abs(values).mean(axis=0))[::-1][:3]
+        for feature_index in order:
+            feature_name = names[int(feature_index)]
+            shap.dependence_plot(feature_name, values, data, feature_names=names, show=False)
+            safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in feature_name)
+            written.append(_save_current(destination / f"dependence_{safe_name}.png"))
+        return written
+
+    def save_patient_waterfall(self, explanation, idx: int, path) -> Path:
+        shap.plots.waterfall(explanation[int(idx)], show=False)
+        return _save_current(path)
+
+    def patient_reasons(self, explanation, idx: int, top_k: int = 5) -> dict[str, list[dict]]:
+        """Up to top_k features pushing risk up, and up to top_k pushing it down."""
+        values, _, names = _arrays(explanation)
+        row = values[int(idx)]
+        order = np.argsort(row)
+        decreases = [
+            {"feature": names[int(feature)], "shap": float(row[int(feature)])}
+            for feature in order
+            if row[int(feature)] < 0
+        ][:top_k]
+        increases = [
+            {"feature": names[int(feature)], "shap": float(row[int(feature)])}
+            for feature in order[::-1]
+            if row[int(feature)] > 0
+        ][:top_k]
+        return {"increases_risk": increases, "decreases_risk": decreases}
+
+    def modality_breakdown(self, explanation, feature_to_modality_map: dict[str, str]) -> dict[str, float]:
+        """Mean absolute SHAP value of the features assigned to each modality."""
+        values, _, names = _arrays(explanation)
+        breakdown = {}
+        for modality in _MODALITIES:
+            columns = [index for index, name in enumerate(names) if feature_to_modality_map.get(name) == modality]
+            breakdown[modality] = float(np.abs(values[:, columns]).mean()) if columns else 0.0
+        return breakdown
+
+
+def _final_estimator(model):
+    if hasattr(model, "named_steps") and "clf" in getattr(model, "named_steps"):
+        return model.named_steps["clf"]
+    return model
+
+
+def _aligned_frame(features, feature_names: list[str]) -> pd.DataFrame:
+    if isinstance(features, pd.DataFrame):
+        return features.loc[:, feature_names]
+    return pd.DataFrame(np.asarray(features, dtype=float), columns=feature_names)
+
+
+def _positive_explanation(explanation: shap.Explanation) -> shap.Explanation:
+    values = np.asarray(explanation.values, dtype=float)
+    if values.ndim < 3:
+        return explanation
+    class_index = values.shape[-1] - 1
+    base = np.asarray(explanation.base_values, dtype=float)
+    if base.ndim >= 2:
+        base = base[..., class_index]
+    data = None if explanation.data is None else np.asarray(explanation.data)
+    return shap.Explanation(
+        values=values[:, :, class_index],
+        base_values=base,
+        data=data,
+        feature_names=explanation.feature_names,
+    )
+
+
+def _arrays(explanation) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    values = np.asarray(explanation.values, dtype=float)
+    if values.ndim == 3:
+        values = values[:, :, -1]
+    data = np.asarray(explanation.data, dtype=float)
+    names = [str(name) for name in explanation.feature_names]
+    return values, data, names
+
+
+def _summary(values, data, names, path: Path, top_k: int, plot_type: str) -> Path:
+    shap.summary_plot(values, data, feature_names=names, show=False, max_display=top_k, plot_type=plot_type)
+    return _save_current(path)
+
+
+def _save_current(path) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(destination, bbox_inches="tight")
+    plt.close()
+    return destination

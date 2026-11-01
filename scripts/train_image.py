@@ -1,83 +1,143 @@
-"""Train + evaluate + explain the ultrasound CNN.
+"""Fine-tune the ultrasound CNN. The training loop runs only from main()."""
 
-    python -m scripts.train_image --config configs/config.yaml
-"""
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
-import torch.nn as nn
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from torch.utils.data import DataLoader
 
-from src.data.ultrasound import UltrasoundDataset, build_transforms, index_folder, load_image_tensor
-from src.evaluation.metrics import compute_metrics, plot_confusion, plot_roc
+from src.data.ultrasound_loader import UltrasoundDataset, build_transforms
+from src.evaluation.metrics import best_threshold, compute_metrics
 from src.explain.shap_image import ImageExplainer
-from src.models.image_model import build_image_model, predict_proba, save_checkpoint, train_one_epoch
-from src.utils import ensure_dir, get_device, get_logger, load_config, save_json, set_seed
-
-log = get_logger("train_image")
+from src.models.image_model import build_image_model, evaluate, load_checkpoint, save_checkpoint, train_one_epoch
+from src.utils import ensure_dir, load_config, save_json, set_seed
 
 
-def main(cfg_path: str) -> None:
-    cfg = load_config(cfg_path)
-    set_seed(cfg["seed"])
-    ic, art, device = cfg["image"], Path(cfg["paths"]["artifacts"]), get_device()
-    ensure_dir(art / "models")
-
-    df = index_folder(cfg["paths"]["ultrasound_dir"], ic["positive_class"])
-    # NOTE: if your dataset has several frames per patient, split by patient id
-    # (GroupShuffleSplit) instead — otherwise leakage inflates accuracy.
-    tr_df, va_df = train_test_split(df, test_size=ic["val_split"], stratify=df.label, random_state=cfg["seed"])
-    log.info("Images: train=%d val=%d (PCOS=%d)", len(tr_df), len(va_df), int(df.label.sum()))
-
-    tr_dl = DataLoader(UltrasoundDataset(tr_df, build_transforms(ic["img_size"], True)),
-                       batch_size=ic["batch_size"], shuffle=True, num_workers=ic["num_workers"])
-    va_ds = UltrasoundDataset(va_df, build_transforms(ic["img_size"], False))
-    va_dl = DataLoader(va_ds, batch_size=ic["batch_size"], num_workers=ic["num_workers"])
-
-    model = build_image_model(ic["backbone"]).to(device)
-    pos = tr_df.label.sum()
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([(len(tr_df) - pos) / max(pos, 1)], device=device))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=ic["lr"], weight_decay=ic["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ic["epochs"])
-
-    best_auc, ckpt = -1.0, art / "models/ultrasound_cnn.pt"
-    for epoch in range(1, ic["epochs"] + 1):
-        loss = train_one_epoch(model, tr_dl, optimizer, criterion, device)
+def main() -> None:
+    config = load_config()
+    seed = int(config["seed"])
+    set_seed(seed)
+    image_config = config["image"]
+    shap_config = config["shap"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    manifest = pd.read_csv(Path.cwd() / "data" / "interim" / "ultrasound_manifest.csv")
+    train_side = manifest.loc[manifest["split"] == "train"].reset_index(drop=True)
+    test_frame = manifest.loc[manifest["split"] == "test"].reset_index(drop=True)
+    if train_side.empty or test_frame.empty:
+        raise FileNotFoundError("The ultrasound manifest needs both a train split and a held-out test split.")
+    fit_frame, val_frame = _split_train_groups(train_side, seed)
+    img_size = int(image_config["img_size"])
+    batch_size = int(image_config["batch_size"])
+    workers = int(image_config["num_workers"])
+    fit_loader = _loader(fit_frame, img_size, batch_size, workers, train=True)
+    val_loader = _loader(val_frame, img_size, batch_size, workers, train=False)
+    test_loader = _loader(test_frame, img_size, batch_size, workers, train=False)
+    model = build_image_model(image_config["backbone"], pretrained=True).to(device)
+    labels = fit_frame["label"].to_numpy(dtype=int)
+    positives = int((labels == 1).sum())
+    if positives == 0:
+        raise ValueError("The group-aware training split has no positive images.")
+    pos_weight = torch.tensor([(labels == 0).sum() / positives], dtype=torch.float32, device=device)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(image_config["lr"]), weight_decay=float(image_config["weight_decay"]))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(image_config["epochs"]))
+    artifacts = _located(config["paths"]["artifacts_dir"])
+    checkpoint_path = ensure_dir(artifacts / "models") / "ultrasound_cnn.pt"
+    best_auc = -1.0
+    best_epoch = 0
+    patience_left = 5
+    epochs_ran = 0
+    for epoch in range(1, int(image_config["epochs"]) + 1):
+        loss = train_one_epoch(model, fit_loader, optimizer, criterion, device)
+        val_probs, val_labels = evaluate(model, val_loader, device)
+        val_auc = _auc(val_labels, val_probs)
         scheduler.step()
-        p, y = predict_proba(model, va_dl, device)
-        m = compute_metrics(y.numpy(), p.numpy())
-        log.info("epoch %02d | loss %.4f | val AUC %.4f | recall %.3f", epoch, loss, m["roc_auc"], m["recall_sensitivity"])
-        if m["roc_auc"] > best_auc:
-            best_auc = m["roc_auc"]
-            save_checkpoint(model, ic["backbone"], ckpt)
+        epochs_ran = epoch
+        print(f"epoch {epoch} loss={loss:.4f} val_auc={val_auc:.4f}")
+        if np.isfinite(val_auc) and val_auc > best_auc:
+            best_auc = val_auc
+            best_epoch = epoch
+            patience_left = 5
+            save_checkpoint(model, optimizer, epoch, val_auc, checkpoint_path)
+        else:
+            patience_left -= 1
+            if patience_left == 0:
+                break
+    if not checkpoint_path.exists():
+        raise RuntimeError("No checkpoint was saved because validation AUC was undefined.")
+    model = load_checkpoint(checkpoint_path, device)
+    val_probs, val_labels = evaluate(model, val_loader, device)
+    threshold = best_threshold(val_labels, val_probs, min_recall=0.9)
+    test_probs, test_labels = evaluate(model, test_loader, device)
+    report = {
+        "best_epoch": best_epoch,
+        "best_val_auc": best_auc,
+        "epochs_ran": epochs_ran,
+        "threshold": threshold,
+        "pos_weight": float(pos_weight.item()),
+        "n_train": int(len(fit_frame)),
+        "n_val": int(len(val_frame)),
+        "n_test": int(len(test_frame)),
+        "test": compute_metrics(test_labels, test_probs, threshold),
+    }
+    save_json(report, ensure_dir(artifacts / "reports") / "image_results.json")
+    _write_shap(model, fit_frame, test_frame, img_size, device, shap_config, artifacts / "figures" / "image", seed)
+    print(
+        f"test auc={report['test']['roc_auc']:.4f} recall={report['test']['recall']:.4f} "
+        f"threshold={threshold:.4f} checkpoint={checkpoint_path}"
+    )
 
-    # ---- final eval with best weights ----
-    model.load_state_dict(torch.load(ckpt, map_location=device)["state_dict"])
-    p, y = predict_proba(model, va_dl, device)
-    save_json(compute_metrics(y.numpy(), p.numpy()), art / "reports/ultrasound_metrics.json")
-    plot_roc({"Ultrasound (CNN)": (y.numpy(), p.numpy())}, art / "figures/ultrasound_roc.png")
-    plot_confusion(y.numpy(), p.numpy(), art / "figures/ultrasound_confusion.png")
 
-    # ---- SHAP on a few validation scans ----
-    sc = cfg["shap"]
-    bg_dl = DataLoader(UltrasoundDataset(tr_df.sample(sc["image_background"], random_state=cfg["seed"]),
-                                         build_transforms(ic["img_size"], False)), batch_size=sc["image_background"])
-    background, _ = next(iter(bg_dl))
-    sample_df = va_df.sample(min(sc["image_samples"], len(va_df)), random_state=cfg["seed"])
-    x = torch.cat([load_image_tensor(pth, ic["img_size"]) for pth in sample_df.image_path])
+def _split_train_groups(frame: pd.DataFrame, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Keep every group_id on one side of an approximately 80/20 training/validation cut."""
+    indices = np.arange(len(frame))
+    labels = frame["label"].to_numpy()
+    groups = frame["group_id"].to_numpy()
+    try:
+        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+        fit_idx, val_idx = next(splitter.split(indices, labels, groups))
+    except ValueError:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+        fit_idx, val_idx = next(splitter.split(indices, labels, groups))
+    return frame.iloc[fit_idx].reset_index(drop=True), frame.iloc[val_idx].reset_index(drop=True)
 
+
+def _loader(frame: pd.DataFrame, img_size: int, batch_size: int, workers: int, train: bool) -> DataLoader:
+    dataset = UltrasoundDataset(frame, build_transforms(img_size, train=train))
+    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=workers)
+
+
+def _write_shap(model, fit_frame, test_frame, img_size, device, shap_config, out_dir, seed) -> None:
+    background_n = min(int(shap_config["image_background"]), len(fit_frame))
+    sample_n = min(int(shap_config["image_samples"]), len(test_frame))
+    generator = np.random.default_rng(seed)
+    fit_dataset = UltrasoundDataset(fit_frame, build_transforms(img_size, train=False))
+    test_dataset = UltrasoundDataset(test_frame, build_transforms(img_size, train=False))
+    background_idx = generator.choice(len(fit_dataset), size=background_n, replace=False)
+    test_idx = generator.choice(len(test_dataset), size=sample_n, replace=False)
+    background = torch.stack([fit_dataset[int(index)][0] for index in background_idx])
+    images = torch.stack([test_dataset[int(index)][0] for index in test_idx])
+    names = [Path(test_frame.iloc[int(index)]["image_path"]).stem for index in test_idx]
     explainer = ImageExplainer(model, background, device)
-    sv = explainer.explain(x, nsamples=sc["image_nsamples"])
-    names = [Path(pth).stem for pth in sample_df.image_path]
-    explainer.save_overlays(x, sv, art / "figures/shap", names)
-    log.info("Done. Best val AUC %.4f", best_auc)
+    values = explainer.explain(images, nsamples=int(shap_config["image_nsamples"]))
+    explainer.save_overlays(images, values, out_dir, names)
+
+
+def _auc(labels: np.ndarray, probabilities: np.ndarray) -> float:
+    if len(np.unique(labels)) < 2:
+        return float("nan")
+    return float(roc_auc_score(labels, probabilities))
+
+
+def _located(path: str) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else Path.cwd() / candidate
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/config.yaml")
-    main(ap.parse_args().config)
+    main()
